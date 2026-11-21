@@ -97,10 +97,13 @@ const (
 	EnvExpectedBackupType = "KUBEVIRT_DM_EXPECTED_BACKUP_TYPE"
 	EnvVeleroBackupName   = "KUBEVIRT_DM_VELERO_BACKUP_NAME"
 	EnvSourcePVCPath      = "KUBEVIRT_DM_SOURCE_PVC_PATH"
-	EnvDataUploadName     = "KUBEVIRT_DM_DATAUPLOAD_NAME"
-	EnvDataUploadUID      = "KUBEVIRT_DM_DATAUPLOAD_UID"
-	EnvVMBName            = "KUBEVIRT_DM_VMB_NAME"
-	EnvVMBTName           = "KUBEVIRT_DM_VMBT_NAME"
+	// EnvCompressFullBackups makes the uploader rewrite full backup images as
+	// sparse, zstd-compressed qcow2 before uploading them.
+	EnvCompressFullBackups = "KUBEVIRT_DM_COMPRESS_FULL_BACKUPS"
+	EnvDataUploadName      = "KUBEVIRT_DM_DATAUPLOAD_NAME"
+	EnvDataUploadUID       = "KUBEVIRT_DM_DATAUPLOAD_UID"
+	EnvVMBName             = "KUBEVIRT_DM_VMB_NAME"
+	EnvVMBTName            = "KUBEVIRT_DM_VMBT_NAME"
 )
 
 // Default paths and values
@@ -140,6 +143,11 @@ type UploaderConfig struct {
 
 	// Source PVC mount path
 	SourcePVCPath string
+
+	// CompressFullBackups rewrites images without a backing file (full backups)
+	// as sparse, zstd-compressed qcow2 before upload. Needs a writable source PVC
+	// with room for the rewritten copy.
+	CompressFullBackups bool
 }
 
 // CheckpointFile represents a single qcow2 file within a checkpoint.

@@ -141,17 +141,18 @@ func LoadConfigFromEnv() (*UploaderConfig, error) {
 			BSLActiveDirectoryAuthorityURI: os.Getenv(common.EnvBSLActiveDirectoryAuthorityURI),
 			CredentialsFile:                os.Getenv(common.EnvCredentialsFile),
 		},
-		VMName:             os.Getenv(EnvVMName),
-		VMNamespace:        os.Getenv(EnvVMNamespace),
-		CheckpointName:     os.Getenv(EnvCheckpointName),
-		BackupType:         os.Getenv(EnvBackupType),
-		ExpectedBackupType: os.Getenv(EnvExpectedBackupType),
-		VeleroBackupName:   os.Getenv(EnvVeleroBackupName),
-		DataUploadName:     os.Getenv(EnvDataUploadName),
-		DataUploadUID:      os.Getenv(EnvDataUploadUID),
-		VMBName:            os.Getenv(EnvVMBName),
-		VMBTName:           os.Getenv(EnvVMBTName),
-		SourcePVCPath:      os.Getenv(EnvSourcePVCPath),
+		VMName:              os.Getenv(EnvVMName),
+		VMNamespace:         os.Getenv(EnvVMNamespace),
+		CheckpointName:      os.Getenv(EnvCheckpointName),
+		BackupType:          os.Getenv(EnvBackupType),
+		ExpectedBackupType:  os.Getenv(EnvExpectedBackupType),
+		VeleroBackupName:    os.Getenv(EnvVeleroBackupName),
+		DataUploadName:      os.Getenv(EnvDataUploadName),
+		DataUploadUID:       os.Getenv(EnvDataUploadUID),
+		VMBName:             os.Getenv(EnvVMBName),
+		VMBTName:            os.Getenv(EnvVMBTName),
+		SourcePVCPath:       os.Getenv(EnvSourcePVCPath),
+		CompressFullBackups: common.ParseBool(os.Getenv(EnvCompressFullBackups)),
 	}
 
 	// Apply defaults
@@ -225,13 +226,30 @@ func uploadQcow2Files(
 		objectPath := fmt.Sprintf("checkpoints/%s/%s/%s/%s",
 			config.VMNamespace, config.VMName, config.CheckpointName, d.Name())
 
-		// Open file for upload
-		file, err := os.Open(path)
-		if err != nil {
-			return fmt.Errorf("failed to open file %s: %w", path, err)
+		// Optionally rewrite full backup images as sparse, compressed qcow2.
+		// QEMU cannot see holes on a raw block device, so a full backup image
+		// is as large as the disk even when most of it is unused.
+		uploadPath := path
+		uploadSize := info.Size()
+		if config.CompressFullBackups {
+			compressedPath, compressedSize, compressErr := compressFullImage(path, logger)
+			if compressErr != nil {
+				return fmt.Errorf("failed to compress %s: %w", path, compressErr)
+			}
+			if compressedPath != "" {
+				defer func() { _ = os.Remove(compressedPath) }()
+				uploadPath = compressedPath
+				uploadSize = compressedSize
+			}
 		}
 
-		logger.Info("Uploading file", "filename", d.Name(), "size", info.Size(), "objectPath", objectPath)
+		// Open file for upload
+		file, err := os.Open(uploadPath)
+		if err != nil {
+			return fmt.Errorf("failed to open file %s: %w", uploadPath, err)
+		}
+
+		logger.Info("Uploading file", "filename", d.Name(), "size", uploadSize, "objectPath", objectPath)
 
 		// Upload file using velero.ObjectStore interface
 		uploadErr := store.PutObject(config.BSLBucket, objectPath, file)
@@ -246,7 +264,7 @@ func uploadQcow2Files(
 		files = append(files, CheckpointFile{
 			Filename:   d.Name(),
 			DiskName:   diskName,
-			Size:       info.Size(),
+			Size:       uploadSize,
 			ObjectPath: objectPath,
 		})
 

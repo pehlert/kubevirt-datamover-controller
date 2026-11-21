@@ -79,6 +79,10 @@ const defaultOutputDevicePath = "/dev/restore-output"
 
 // DatamoverPodConfig contains configuration for building a datamover pod.
 type DatamoverPodConfig struct {
+	// CompressFullBackups makes the uploader rewrite full backup images before
+	// upload; the backup data volume is then mounted read-write.
+	CompressFullBackups bool
+
 	// OperationMode selects upload or download. Defaults to upload.
 	OperationMode OperationMode
 
@@ -478,6 +482,7 @@ func buildUploadPodResources(config *DatamoverPodConfig) ([]corev1.EnvVar, []cor
 		corev1.EnvVar{Name: uploader.EnvExpectedBackupType, Value: config.ExpectedBackupType},
 		corev1.EnvVar{Name: uploader.EnvVeleroBackupName, Value: config.VeleroBackupName},
 		corev1.EnvVar{Name: uploader.EnvSourcePVCPath, Value: uploader.DefaultSourcePVCPath},
+		corev1.EnvVar{Name: uploader.EnvCompressFullBackups, Value: strconv.FormatBool(config.CompressFullBackups)},
 		corev1.EnvVar{Name: uploader.EnvDataUploadName, Value: config.ResourceName},
 		corev1.EnvVar{Name: uploader.EnvDataUploadUID, Value: config.ResourceUID},
 		corev1.EnvVar{Name: uploader.EnvVMBName, Value: config.VMBName},
@@ -490,7 +495,7 @@ func buildUploadPodResources(config *DatamoverPodConfig) ([]corev1.EnvVar, []cor
 			VolumeSource: corev1.VolumeSource{
 				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
 					ClaimName: config.SourcePVCName,
-					ReadOnly:  true,
+					ReadOnly:  !config.CompressFullBackups,
 				},
 			},
 		},
@@ -502,7 +507,7 @@ func buildUploadPodResources(config *DatamoverPodConfig) ([]corev1.EnvVar, []cor
 		{
 			Name:      backupDataVolumeName,
 			MountPath: uploader.DefaultSourcePVCPath,
-			ReadOnly:  true,
+			ReadOnly:  !config.CompressFullBackups,
 		},
 		buildCredentialsVolumeMount(),
 		buildBoundSATokenVolumeMount(),

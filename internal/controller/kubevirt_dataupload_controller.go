@@ -114,6 +114,11 @@ type KubeVirtDataUploadReconciler struct {
 	// before forcing a full backup. 0 means unlimited.
 	MaxIncrementalBackups int
 
+	// CompressFullBackups makes the uploader pod rewrite full backup images as
+	// sparse, compressed qcow2 before upload. The temporary backup PVC is then
+	// mounted read-write and sized for the original plus the rewritten copy.
+	CompressFullBackups bool
+
 	// StaleDataUploadThreshold is the duration after which a DataUpload in an
 	// active phase is considered stale and will no longer block younger
 	// DataUploads for the same VM.
@@ -1658,6 +1663,20 @@ func listTempPVC(ctx context.Context, reader client.Reader, du *velerov2alpha1.D
 // ext4/xfs) and qcow2 metadata, ensuring the backup has enough room to complete.
 const sizeOverheadPercent = 20
 
+// compressedSizeOverheadPercent is used instead when full backups are rewritten
+// before upload: the PVC must hold the original image and, in the worst case,
+// an equally large rewritten copy.
+const compressedSizeOverheadPercent = 120
+
+// backupPVCOverheadPercent returns the overhead to add on top of the source
+// disk capacity when sizing the temporary backup PVC.
+func (r *KubeVirtDataUploadReconciler) backupPVCOverheadPercent() int64 {
+	if r.CompressFullBackups {
+		return compressedSizeOverheadPercent
+	}
+	return sizeOverheadPercent
+}
+
 // calculateBackupPVCSize determines the appropriate size for the temporary backup PVC.
 //
 // Priority:
@@ -1723,7 +1742,7 @@ func (r *KubeVirtDataUploadReconciler) calculateBackupPVCSize(ctx context.Contex
 					}
 				}
 				if !totalCapacity.IsZero() {
-					withOverhead := addOverhead(totalCapacity, sizeOverheadPercent)
+					withOverhead := addOverhead(totalCapacity, r.backupPVCOverheadPercent())
 					if withOverhead.Cmp(minSize) < 0 {
 						withOverhead = minSize
 					}
@@ -1731,7 +1750,7 @@ func (r *KubeVirtDataUploadReconciler) calculateBackupPVCSize(ctx context.Contex
 						"vmName", vmRef.Name,
 						"diskCount", len(pvcNames),
 						"totalCapacity", totalCapacity.String(),
-						"overheadPercent", sizeOverheadPercent,
+						"overheadPercent", r.backupPVCOverheadPercent(),
 						"finalSize", withOverhead.String())
 					return withOverhead, nil
 				}
@@ -1752,14 +1771,14 @@ func (r *KubeVirtDataUploadReconciler) calculateBackupPVCSize(ctx context.Contex
 		}
 
 		if capacity, ok := sourcePVC.Status.Capacity[corev1.ResourceStorage]; ok {
-			withOverhead := addOverhead(capacity, sizeOverheadPercent)
+			withOverhead := addOverhead(capacity, r.backupPVCOverheadPercent())
 			if withOverhead.Cmp(minSize) < 0 {
 				withOverhead = minSize
 			}
 			logger.Info("Sizing backup PVC from source PVC capacity",
 				"sourcePVC", sourcePVCName,
 				"sourceCapacity", capacity.String(),
-				"overheadPercent", sizeOverheadPercent,
+				"overheadPercent", r.backupPVCOverheadPercent(),
 				"finalSize", withOverhead.String())
 			return withOverhead, nil
 		}
@@ -2315,6 +2334,7 @@ func (r *KubeVirtDataUploadReconciler) buildDatamoverPodConfig(
 		VMNamespace:                    vmRef.Namespace,
 		CheckpointName:                 checkpointName,
 		BackupType:                     backupType,
+		CompressFullBackups:            r.CompressFullBackups,
 		ExpectedBackupType:             expectedBackupType,
 		VeleroBackupName:               getVeleroBackupName(du.Labels),
 		ResourceName:                   du.Name,

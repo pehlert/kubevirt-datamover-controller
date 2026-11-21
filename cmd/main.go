@@ -106,6 +106,7 @@ func main() {
 	var datamoverImage string
 	var datamoverImagePullPolicy string
 	var oadpNamespace string
+	var compressFullBackups bool
 	var maxIncrementalBackups int
 	var maxConcurrentDataMovers int
 	var staleDataUploadThreshold time.Duration
@@ -135,6 +136,9 @@ func main() {
 		"Image pull policy for datamover pods (Always, IfNotPresent, Never)")
 	flag.StringVar(&oadpNamespace, "oadp-namespace", "openshift-adp",
 		"Namespace where OADP/Velero resources are located")
+	flag.BoolVar(&compressFullBackups, "compress-full-backups", false,
+		"Rewrite full backup images as sparse, zstd-compressed qcow2 before upload. "+
+			"The temporary backup PVC is sized to hold the original and the rewritten copy.")
 	flag.IntVar(&maxIncrementalBackups, "max-incremental-backups", 0,
 		"Maximum number of incremental backups per VM before forcing a full backup (0 = unlimited)")
 	flag.IntVar(&maxConcurrentDataMovers, "max-concurrent-data-movers", common.DefaultMaxConcurrentDataMovers,
@@ -283,6 +287,7 @@ func main() {
 		DatamoverImage:           datamoverImage,
 		DatamoverImagePullPolicy: corev1.PullPolicy(datamoverImagePullPolicy),
 		MaxIncrementalBackups:    maxIncrementalBackups,
+		CompressFullBackups:      compressFullBackups,
 		OADPNamespace:            oadpNamespace,
 		StaleDataUploadThreshold: staleDataUploadThreshold,
 		PodLogCollector:          controller.NewPodLogCollector(kubeClient, 100),
