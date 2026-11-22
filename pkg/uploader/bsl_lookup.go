@@ -42,6 +42,10 @@ type CheckpointLookupResult struct {
 	// ChainLength is the number of checkpoints in the valid chain
 	ChainLength int
 
+	// Format is the storage format of the latest valid checkpoint. An
+	// incremental backup in another format must not be chained onto it.
+	Format string
+
 	// Message provides a human-readable description of the lookup result
 	Message string
 }
@@ -196,6 +200,7 @@ func validateCheckpointChain(
 			}
 			return &CheckpointLookupResult{
 				Found:            true,
+				Format:           chain[len(chain)-1].Format,
 				LatestCheckpoint: currentTargetID,
 				IsChainValid:     isOriginalTarget,
 				ChainLength:      len(chain),

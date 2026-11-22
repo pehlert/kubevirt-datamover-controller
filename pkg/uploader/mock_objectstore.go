@@ -96,6 +96,23 @@ func (m *MockObjectStore) GetObject(bucket, key string) (io.ReadCloser, error) {
 	return io.NopCloser(bytes.NewReader(data)), nil
 }
 
+// GetObjectRange implements RangeReader.
+func (m *MockObjectStore) GetObjectRange(bucket, key string, offset, length int64) (io.ReadCloser, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	fullKey := m.fullKey(key)
+	data, ok := m.objects[fullKey]
+	if !ok {
+		return nil, fmt.Errorf("object not found: %s", fullKey)
+	}
+	if offset < 0 || length < 0 || offset > int64(len(data)) {
+		return nil, fmt.Errorf("range %d+%d outside object %s (%d bytes)", offset, length, fullKey, len(data))
+	}
+	end := min(offset+length, int64(len(data)))
+	return io.NopCloser(bytes.NewReader(data[offset:end])), nil
+}
+
 // ObjectExists implements velero.ObjectStore.ObjectExists
 func (m *MockObjectStore) ObjectExists(bucket, key string) (bool, error) {
 	m.mu.RLock()

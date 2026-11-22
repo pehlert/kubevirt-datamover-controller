@@ -117,6 +117,19 @@ const (
 	BackupTypeIncremental = "incremental"
 )
 
+// Checkpoint storage formats. A checkpoint chain never mixes formats: an
+// incremental is only valid on top of a parent stored in the same format.
+const (
+	// CheckpointFormatQcow2 is the original format: one qcow2 image per disk,
+	// incrementals with a backing-file pointer. It is the zero value so that
+	// index entries written before the field existed read as qcow2.
+	CheckpointFormatQcow2 = ""
+
+	// CheckpointFormatBlocks stores each disk as fixed-size, individually
+	// compressed blocks in one data object plus a block index object.
+	CheckpointFormatBlocks = "blocks"
+)
+
 // UploaderConfig holds configuration loaded from environment variables.
 type UploaderConfig struct {
 	// ObjectStoreConfig holds BSL/object-store connection settings, shared
@@ -148,6 +161,10 @@ type UploaderConfig struct {
 	// as sparse, zstd-compressed qcow2 before upload. Needs a writable source PVC
 	// with room for the rewritten copy.
 	CompressFullBackups bool
+
+	// Format is the storage format of the checkpoint being recorded
+	// (CheckpointFormatQcow2 or CheckpointFormatBlocks).
+	Format string
 }
 
 // CheckpointFile represents a single qcow2 file within a checkpoint.
@@ -174,6 +191,10 @@ type CheckpointEntry struct {
 
 	// Type indicates whether this is a "full" or "incremental" backup
 	Type string `json:"type"`
+
+	// Format is the storage format of the checkpoint's files. Empty means
+	// qcow2 images; "blocks" means compressed block objects with an index.
+	Format string `json:"format,omitempty"`
 
 	// Parent is the checkpoint this one is based on (design: "parent")
 	Parent string `json:"parent,omitempty"`

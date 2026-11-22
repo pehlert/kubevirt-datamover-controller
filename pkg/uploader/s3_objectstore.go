@@ -47,6 +47,12 @@ import (
 // Compile-time check that S3ObjectStore implements velero.ObjectStore
 var _ velero.ObjectStore = (*S3ObjectStore)(nil)
 
+// Compile-time checks for the optional streaming and range extensions.
+var (
+	_ StreamUploader = (*S3ObjectStore)(nil)
+	_ RangeReader    = (*S3ObjectStore)(nil)
+)
+
 // S3ObjectStore implements velero.ObjectStore for AWS S3 and S3-compatible storage.
 type S3ObjectStore struct {
 	client   *s3.Client
@@ -242,6 +248,16 @@ func (s *S3ObjectStore) fullKey(key string) string {
 // PutObject uploads an object to S3.
 // Implements velero.ObjectStore.PutObject().
 func (s *S3ObjectStore) PutObject(bucket, key string, body io.Reader) error {
+	_, err := s.uploader.UploadObject(context.Background(), s.uploadInput(bucket, key, body))
+	if err != nil {
+		return fmt.Errorf("failed to upload object %s: %w", key, err)
+	}
+	return nil
+}
+
+// uploadInput builds the upload request shared by PutObject and
+// PutObjectStream, including the configured encryption and checksum settings.
+func (s *S3ObjectStore) uploadInput(bucket, key string, body io.Reader) *transfermanager.UploadObjectInput {
 	input := &transfermanager.UploadObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(s.fullKey(key)),
@@ -261,11 +277,50 @@ func (s *S3ObjectStore) PutObject(bucket, key string, body io.Reader) error {
 		input.SSECustomerKey = aws.String(s.sseCustomerKey)
 		input.SSECustomerKeyMD5 = aws.String(s.sseCustomerKeyMD5)
 	}
-	_, err := s.uploader.UploadObject(context.Background(), input)
+	return input
+}
+
+// streamUploadConcurrency is the number of parts of a stream upload that are
+// sent in parallel. Each in-flight part is buffered in memory.
+const streamUploadConcurrency = 4
+
+// PutObjectStream uploads a stream of unknown length as a multipart upload
+// with the given part size. Implements StreamUploader.
+func (s *S3ObjectStore) PutObjectStream(bucket, key string, body io.Reader, partSize int64) error {
+	input := s.uploadInput(bucket, key, body)
+	_, err := s.uploader.UploadObject(context.Background(), input, func(o *transfermanager.Options) {
+		if partSize > 0 {
+			o.PartSizeBytes = partSize
+		}
+		o.Concurrency = streamUploadConcurrency
+	})
 	if err != nil {
 		return fmt.Errorf("failed to upload object %s: %w", key, err)
 	}
 	return nil
+}
+
+// GetObjectRange retrieves length bytes of an object starting at offset.
+// Implements RangeReader.
+func (s *S3ObjectStore) GetObjectRange(bucket, key string, offset, length int64) (io.ReadCloser, error) {
+	if length <= 0 {
+		return io.NopCloser(bytes.NewReader(nil)), nil
+	}
+	input := &s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(s.fullKey(key)),
+		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)),
+	}
+	if s.sseCustomerAlgorithm != "" {
+		input.SSECustomerAlgorithm = aws.String(s.sseCustomerAlgorithm)
+		input.SSECustomerKey = aws.String(s.sseCustomerKey)
+		input.SSECustomerKeyMD5 = aws.String(s.sseCustomerKeyMD5)
+	}
+	output, err := s.client.GetObject(context.Background(), input)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get range %d+%d of object %s: %w", offset, length, key, err)
+	}
+	return output.Body, nil
 }
 
 // GetObject retrieves an object from S3.

@@ -403,6 +403,7 @@ func updateVMIndex(
 	checkpoint := CheckpointEntry{
 		ID:             config.CheckpointName,
 		Type:           config.BackupType,
+		Format:         config.Format,
 		Timestamp:      time.Now().UTC(),
 		VMBackup:       config.VMBName,
 		Files:          files,
@@ -447,6 +448,14 @@ func updateVMIndex(
 				"checkpoint chain is broken: latest valid checkpoint is %s but expected %s; "+
 					"a full backup should have been performed instead",
 				result.LatestCheckpoint, latestCP.ID)
+		}
+		// A chain never mixes storage formats: the restore path reads a chain
+		// either as qcow2 backing files or as block indexes, not both.
+		if latestCP.Format != config.Format {
+			return fmt.Errorf(
+				"incremental backup in format %q cannot be chained onto checkpoint %s in format %q; "+
+					"a full backup should have been performed instead",
+				formatName(config.Format), latestCP.ID, formatName(latestCP.Format))
 		}
 		checkpoint.Parent = result.LatestCheckpoint
 	}
@@ -578,6 +587,45 @@ func updateBackupManifests(
 
 	return nil
 }
+
+// formatName returns a printable name for a checkpoint storage format.
+func formatName(format string) string {
+	if format == CheckpointFormatQcow2 {
+		return "qcow2"
+	}
+	return format
+}
+
+// CommitCheckpoint records a checkpoint whose data files are already in the
+// object store: it archives the VMB/VMBT, writes the per-VM index entry and
+// the backup manifests, and only then deletes the VirtualMachineBackup.
+//
+// The order is the point. For a pull-mode backup, ending the
+// VirtualMachineBackup makes KubeVirt advance the tracker's checkpoint
+// whether or not the data was stored. Writing the index entry first means a
+// failure at any earlier step leaves the tracker and the index in
+// disagreement, which the controller answers with a full backup next time.
+func CommitCheckpoint(
+	ctx context.Context, store velero.ObjectStore, k8sClient client.Client, config *UploaderConfig,
+	files []CheckpointFile, logger logr.Logger,
+) error {
+	archived, err := archiveKubeResources(ctx, store, k8sClient, config, logger)
+	if err != nil {
+		return fmt.Errorf("failed to archive Kube resources: %w", err)
+	}
+	if err := updateVMIndex(ctx, store, k8sClient, config, files, archived, logger); err != nil {
+		return fmt.Errorf("failed to update VM index: %w", err)
+	}
+	logger.Info("VM index updated", "checkpoint", config.CheckpointName)
+	if err := updateBackupManifests(ctx, store, config, logger); err != nil {
+		return fmt.Errorf("failed to update backup manifests: %w", err)
+	}
+	cleanupKubeResources(ctx, k8sClient, config, logger)
+	return nil
+}
+
+// NewKubeClient creates the in-cluster client used by the datamover pods.
+func NewKubeClient() (client.Client, error) { return newKubeClient() }
 
 // archivedPaths holds the S3 paths where VMB and VMBT CRs were archived.
 // These paths are passed to updateVMIndex so the checkpoint entry references them.

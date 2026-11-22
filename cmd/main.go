@@ -49,6 +49,7 @@ import (
 	"github.com/migtools/kubevirt-datamover-controller/internal/controller"
 	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
 	"github.com/migtools/kubevirt-datamover-controller/pkg/downloader"
+	"github.com/migtools/kubevirt-datamover-controller/pkg/puller"
 	"github.com/migtools/kubevirt-datamover-controller/pkg/uploader"
 	// +kubebuilder:scaffold:imports
 )
@@ -89,6 +90,27 @@ func main() {
 		defer stop()
 		downloadLogger := zap.New(zap.UseDevMode(false)).WithName("downloader")
 		if err := downloader.Run(ctx, downloadLogger); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if len(os.Args) > 1 && os.Args[1] == "pull" {
+		// Run the streaming (pull-mode) backup transfer.
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		if err := puller.Run(ctx, zap.New(zap.UseDevMode(false)).WithName("puller")); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "verify" {
+		// Re-read block-format checkpoints and check every block checksum.
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		if err := puller.RunVerify(ctx, zap.New(zap.UseDevMode(false)).WithName("verify")); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
