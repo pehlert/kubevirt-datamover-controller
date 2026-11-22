@@ -83,8 +83,12 @@ exporting before everything is read (its TTL expired, or it was deleted),
 the transfer fails at once and says so, instead of running into network
 errors. Choose `--pull-backup-ttl` longer than the longest full backup.
 
-A live migration requested while a backup is open is not rejected: KubeVirt
-keeps it pending until the backup has ended and then runs it.
+A live migration requested while a backup is open does not disturb the
+backup: KubeVirt keeps the migration pending for as long as the backup is
+open. It can time out while waiting; in a test with KubeVirt 1.10 a migration
+that had been pending for about ten minutes was marked failed when the backup
+ended, and the VM stayed on its node. Plan node maintenance and KubeVirt
+upgrades outside the backup window.
 
 ## Storage format
 
