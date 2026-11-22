@@ -78,6 +78,14 @@ A VM that reports `Paused` while its backup is open ends the transfer at
 once: the pod deletes the VirtualMachineBackup, which lets the VM resume, and
 fails. The next backup is a full one.
 
+The transfer pod also watches the VirtualMachineBackup itself. If it stops
+exporting before everything is read (its TTL expired, or it was deleted),
+the transfer fails at once and says so, instead of running into network
+errors. Choose `--pull-backup-ttl` longer than the longest full backup.
+
+A live migration requested while a backup is open is not rejected: KubeVirt
+keeps it pending until the backup has ended and then runs it.
+
 ## Storage format
 
 Per disk and checkpoint:

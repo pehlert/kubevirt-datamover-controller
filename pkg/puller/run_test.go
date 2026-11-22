@@ -145,6 +145,7 @@ type transferEnv struct {
 	events  []string
 	vmbType string
 	paused  bool
+	ended   bool
 	mu      sync.Mutex
 }
 
@@ -167,6 +168,9 @@ func newTransferEnv(t *testing.T, disk []byte, extents []Extent, backupType stri
 			Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
 				Source: corev1.TypedLocalObjectReference{APIGroup: &apiGroup, Kind: "VirtualMachineBackupTracker", Name: "vmbt1"},
 			},
+			Status: &kubevirtbackupv1alpha1.VirtualMachineBackupStatus{Conditions: []kubevirtbackupv1alpha1.Condition{
+				{Type: kubevirtbackupv1alpha1.ConditionProgressing, Status: corev1.ConditionTrue, Reason: ExportReadyReason},
+			}},
 		},
 		&kubevirtcorev1.VirtualMachine{
 			ObjectMeta: metav1.ObjectMeta{Name: "vm", Namespace: "ns"},
@@ -207,6 +211,18 @@ func newTransferEnv(t *testing.T, disk []byte, extents []Extent, backupType stri
 							"mapEndpoint":  env.server.URL + "/exports/root/map",
 						}},
 					}},
+				}
+				return nil
+			case *kubevirtbackupv1alpha1.VirtualMachineBackup:
+				if err := c.Get(ctx, key, obj, opts...); err != nil {
+					return err
+				}
+				if env.ended {
+					// What KubeVirt reports once the TTL of a pull backup expired.
+					o.Status.Conditions = []kubevirtbackupv1alpha1.Condition{
+						{Type: kubevirtbackupv1alpha1.ConditionProgressing, Status: corev1.ConditionFalse, Reason: "Completed"},
+						{Type: "Complete", Status: corev1.ConditionTrue, Reason: "Completed"},
+					}
 				}
 				return nil
 			case *kubevirtcorev1.VirtualMachineInstance:
@@ -396,6 +412,17 @@ func TestRunTransferFailureLeavesNoCheckpoint(t *testing.T) {
 		env.cfg.RateLimitBytes = DefaultBlockSize
 		err := env.run()
 		require.ErrorIs(t, err, ErrVMPaused)
+		assertNoCheckpoint(t, env)
+	})
+	t.Run("backup ends before the transfer (TTL expiry)", func(t *testing.T) {
+		oldInterval := pausePollInterval
+		pausePollInterval = 5 * time.Millisecond
+		defer func() { pausePollInterval = oldInterval }()
+		env := newTransferEnv(t, disk, extents, uploader.BackupTypeFull)
+		env.ended = true
+		env.cfg.RateLimitBytes = DefaultBlockSize
+		err := env.run()
+		require.ErrorIs(t, err, ErrBackupEnded)
 		assertNoCheckpoint(t, env)
 	})
 }

@@ -76,6 +76,11 @@ var transferDefaults = DefaultTransferOptions
 // ErrVMPaused ends a transfer because the VM was paused while its backup was open.
 var ErrVMPaused = errors.New("the virtual machine is paused")
 
+// ErrBackupEnded ends a transfer because the backup stopped exporting before
+// everything was read. KubeVirt ends a pull backup when its TTL expires or
+// the VM's node is drained, and removes the export endpoint with it.
+var ErrBackupEnded = errors.New("the VirtualMachineBackup ended before the transfer finished")
+
 // Config is the configuration of the pull subcommand.
 type Config struct {
 	*uploader.UploaderConfig
@@ -266,6 +271,7 @@ func runTransfer(parent context.Context, cfg *Config, store velero.ObjectStore, 
 	token := strings.TrimSpace(string(tokenData))
 
 	go watchPaused(ctx, k8sClient, cfg, cancel, logger)
+	go watchBackup(ctx, k8sClient, cfg, cancel, logger)
 
 	progress := &Progress{}
 	opts := transferDefaults()
@@ -475,6 +481,52 @@ func watchPaused(
 		if paused, detail := vmiPaused(vmi); paused {
 			logger.Info("VirtualMachineInstance is paused, ending the backup", "detail", detail)
 			cancel(fmt.Errorf("%w during the backup (%s); the backup was ended to let it resume", ErrVMPaused, detail))
+			return
+		}
+	}
+}
+
+// exportOpen reports whether a backup still exports its volumes.
+func exportOpen(vmb *kubevirtbackupv1alpha1.VirtualMachineBackup) bool {
+	if vmb.Status == nil {
+		return false
+	}
+	for _, c := range vmb.Status.Conditions {
+		if c.Type == kubevirtbackupv1alpha1.ConditionProgressing {
+			return c.Status == corev1.ConditionTrue && c.Reason == ExportReadyReason
+		}
+	}
+	return false
+}
+
+// watchBackup cancels the transfer when the backup is gone or no longer
+// exports. Without it the readers would only notice through failing
+// requests and report an unrelated network error after their retries.
+func watchBackup(
+	ctx context.Context, k8sClient client.Client, cfg *Config, cancel context.CancelCauseFunc, logger logr.Logger,
+) {
+	ticker := time.NewTicker(pausePollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{}
+		err := k8sClient.Get(ctx, types.NamespacedName{Name: cfg.VMBName, Namespace: cfg.VMNamespace}, vmb)
+		switch {
+		case apierrors.IsNotFound(err):
+			logger.Info("VirtualMachineBackup is gone, ending the transfer")
+			cancel(fmt.Errorf("%w: it was deleted", ErrBackupEnded))
+			return
+		case err != nil:
+			if ctx.Err() == nil {
+				logger.V(1).Info("Could not read VirtualMachineBackup for the export check", "reason", err.Error())
+			}
+		case !exportOpen(vmb):
+			logger.Info("VirtualMachineBackup no longer exports, ending the transfer", "conditions", vmb.Status)
+			cancel(fmt.Errorf("%w (its TTL expired or the VM was moved); the next backup will be a full one", ErrBackupEnded))
 			return
 		}
 	}
