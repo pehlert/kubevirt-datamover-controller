@@ -6,3 +6,7 @@ rules:
 - apiGroups: ["backup.kubevirt.io"]
   resources: ["virtualmachinebackups", "virtualmachinebackuptrackers"]
   verbs: ["get", "list", "delete"]
+# The pull transfer watches the VM for a pause while its backup is open.
+- apiGroups: ["kubevirt.io"]
+  resources: ["virtualmachineinstances"]
+  verbs: ["get"]

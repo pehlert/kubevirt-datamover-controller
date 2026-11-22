@@ -38,6 +38,7 @@ rules:
   - ""
   resources:
   - pods
+  - secrets
   verbs:
   - create
   - delete
@@ -50,14 +51,6 @@ rules:
   - pods/log
   verbs:
   - get
-- apiGroups:
-  - ""
-  resources:
-  - secrets
-  verbs:
-  - get
-  - list
-  - watch
 - apiGroups:
   - backup.kubevirt.io
   resources:

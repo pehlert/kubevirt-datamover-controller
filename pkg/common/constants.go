@@ -18,7 +18,10 @@ limitations under the License.
 // the kubevirt-datamover-controller and kubevirt-datamover-plugin.
 package common
 
-import "time"
+import (
+	"os"
+	"time"
+)
 
 // Annotation keys for DataUpload and DataDownload resources
 const (
@@ -211,13 +214,53 @@ const (
 
 	// PodTypeDownload identifies a datamover pod running the download (restore) path.
 	PodTypeDownload = "download"
+
+	// PodTypePull identifies a datamover pod running the streaming pull backup path.
+	PodTypePull = "pull"
 )
 
-// DataMover identifier
+// EnvDataMoverName overrides the data mover name (see DataMoverKubeVirt).
+const EnvDataMoverName = "KUBEVIRT_DATAMOVER_NAME"
+
+// DataMoverKubeVirt is the datamover value that indicates the kubevirt
+// datamover controller should handle the DataUpload/DataDownload. It is
+// "kubevirt" unless EnvDataMoverName is set in the environment of both the
+// controller and the Velero server running the plugin. A second, separately
+// named installation can then run next to the first one without either
+// controller picking up the other's DataUploads and DataDownloads.
+var DataMoverKubeVirt = dataMoverName()
+
+func dataMoverName() string {
+	if name := os.Getenv(EnvDataMoverName); name != "" {
+		return name
+	}
+	return "kubevirt"
+}
+
+// Backup transfer modes.
 const (
-	// DataMoverKubeVirt is the datamover value that indicates the kubevirt
-	// datamover controller should handle the DataUpload/DataDownload.
-	DataMoverKubeVirt = "kubevirt"
+	// BackupModePush lets KubeVirt write the backup image into a temporary
+	// PVC, from where the datamover pod uploads it. This is the default.
+	BackupModePush = "push"
+
+	// BackupModePull reads the disk through the backup export endpoint and
+	// streams it to the object store without staging it on a volume.
+	BackupModePull = "pull"
+
+	// AnnotationBackupMode selects the transfer mode. On a VirtualMachine it
+	// overrides the controller's --backup-mode for that VM. The controller
+	// records the mode it chose on the DataUpload under the same key.
+	AnnotationBackupMode = "kubevirt-datamover.io/backup-mode"
+
+	// AnnotationPullCleanupDone marks a pull-mode DataUpload whose
+	// VirtualMachineBackup, token Secrets and scratch PVC have been removed.
+	AnnotationPullCleanupDone = "kubevirt-datamover.io/pull-cleanup-done"
+
+	// PullTokenSecretPrefix is the name prefix of the export token Secrets.
+	PullTokenSecretPrefix = "kubevirt-dm-token-"
+
+	// PullTokenSecretKey is the key KubeVirt reads the export token from.
+	PullTokenSecretKey = "token"
 )
 
 // BSL prefix for datamover objects

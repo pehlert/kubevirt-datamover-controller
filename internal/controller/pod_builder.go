@@ -25,6 +25,7 @@ import (
 
 	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
 	"github.com/migtools/kubevirt-datamover-controller/pkg/downloader"
+	"github.com/migtools/kubevirt-datamover-controller/pkg/puller"
 	"github.com/migtools/kubevirt-datamover-controller/pkg/uploader"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -39,6 +40,9 @@ const (
 
 	// OperationModeDownload runs the restore download path.
 	OperationModeDownload OperationMode = OperationMode(common.PodTypeDownload)
+
+	// OperationModePull runs the streaming pull backup path.
+	OperationModePull OperationMode = OperationMode(common.PodTypePull)
 )
 
 // downloadTargetFilename is where the reconstructed raw disk image is written,
@@ -175,6 +179,15 @@ type DatamoverPodConfig struct {
 	// filter the checkpoint chain down to the matching file.
 	TargetVolume string
 
+	// ExportTokenSecretName (pull mode only): Secret in the pod's namespace
+	// holding the export token of the VirtualMachineBackup.
+	ExportTokenSecretName string
+
+	// PullReaders and PullRateLimitMiB (pull mode only) tune the transfer;
+	// zero leaves the transfer client's default in place.
+	PullReaders      int
+	PullRateLimitMiB int
+
 	// Labels for pod
 	Labels map[string]string
 }
@@ -225,9 +238,12 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 	var volumeMounts []corev1.VolumeMount
 	var volumeDevices []corev1.VolumeDevice
 
-	if mode == OperationModeDownload {
+	switch mode {
+	case OperationModeDownload:
 		envVars, volumes, volumeMounts, volumeDevices = buildDownloadPodResources(config)
-	} else {
+	case OperationModePull:
+		envVars, volumes, volumeMounts = buildPullPodResources(config)
+	default:
 		envVars, volumes, volumeMounts = buildUploadPodResources(config)
 	}
 
@@ -513,6 +529,61 @@ func buildUploadPodResources(config *DatamoverPodConfig) ([]corev1.EnvVar, []cor
 		buildBoundSATokenVolumeMount(),
 	}
 
+	return envVars, volumes, volumeMounts
+}
+
+// exportTokenVolumeName is the pull-mode export token volume/mount name.
+const exportTokenVolumeName = "export-token"
+
+// buildPullPodResources returns the env vars, volumes, and volume mounts for
+// a pull-mode (OperationModePull) datamover pod. Unlike the upload pod it
+// mounts no backup volume: the disk is read over the network from the
+// backup's export endpoint and streamed to the object store.
+func buildPullPodResources(config *DatamoverPodConfig) ([]corev1.EnvVar, []corev1.Volume, []corev1.VolumeMount) {
+	envVars := append(buildSharedBSLEnvVars(config),
+		corev1.EnvVar{Name: common.EnvBSLKMSKeyName, Value: config.BSLKMSKeyName},
+		corev1.EnvVar{Name: uploader.EnvVMName, Value: config.VMName},
+		corev1.EnvVar{Name: uploader.EnvVMNamespace, Value: config.VMNamespace},
+		corev1.EnvVar{Name: uploader.EnvCheckpointName, Value: config.CheckpointName},
+		corev1.EnvVar{Name: uploader.EnvBackupType, Value: config.BackupType},
+		corev1.EnvVar{Name: uploader.EnvExpectedBackupType, Value: config.ExpectedBackupType},
+		corev1.EnvVar{Name: uploader.EnvVeleroBackupName, Value: config.VeleroBackupName},
+		corev1.EnvVar{Name: uploader.EnvDataUploadName, Value: config.ResourceName},
+		corev1.EnvVar{Name: uploader.EnvDataUploadUID, Value: config.ResourceUID},
+		corev1.EnvVar{Name: uploader.EnvVMBName, Value: config.VMBName},
+		corev1.EnvVar{Name: uploader.EnvVMBTName, Value: config.VMBTName},
+		corev1.EnvVar{Name: puller.EnvTokenFile, Value: puller.DefaultTokenFile},
+	)
+	if config.PullReaders > 0 {
+		envVars = append(envVars, corev1.EnvVar{Name: puller.EnvReaders, Value: strconv.Itoa(config.PullReaders)})
+	}
+	if config.PullRateLimitMiB > 0 {
+		envVars = append(envVars, corev1.EnvVar{Name: puller.EnvRateLimitMiB, Value: strconv.Itoa(config.PullRateLimitMiB)})
+	}
+
+	tokenMode := int32(0400)
+	volumes := []corev1.Volume{
+		{
+			Name: exportTokenVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName:  config.ExportTokenSecretName,
+					DefaultMode: &tokenMode,
+				},
+			},
+		},
+		buildCredentialsVolume(config),
+		buildBoundSATokenVolume(),
+	}
+	volumeMounts := []corev1.VolumeMount{
+		{
+			Name:      exportTokenVolumeName,
+			MountPath: path.Dir(puller.DefaultTokenFile),
+			ReadOnly:  true,
+		},
+		buildCredentialsVolumeMount(),
+		buildBoundSATokenVolumeMount(),
+	}
 	return envVars, volumes, volumeMounts
 }
 

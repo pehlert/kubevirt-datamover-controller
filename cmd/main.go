@@ -132,6 +132,9 @@ func main() {
 	var maxIncrementalBackups int
 	var maxConcurrentDataMovers int
 	var staleDataUploadThreshold time.Duration
+	var backupMode string
+	var pullReaders, pullRateLimitMiB int
+	var pullBackupTTL time.Duration
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -169,6 +172,16 @@ func main() {
 	flag.DurationVar(&staleDataUploadThreshold, "stale-dataupload-threshold",
 		common.DefaultStaleDataUploadThreshold,
 		"Duration after which a stale DataUpload stops blocking younger ones for the same VM")
+	flag.StringVar(&backupMode, "backup-mode", common.BackupModePush,
+		"How backup data reaches the object store: \"push\" stages the backup image in a temporary PVC, "+
+			"\"pull\" streams the disk from the backup export endpoint without staging it. "+
+			"A VirtualMachine can override this with the kubevirt-datamover.io/backup-mode annotation.")
+	flag.IntVar(&pullReaders, "pull-readers", 0,
+		"Number of parallel ranged reads of a pull-mode transfer (0 = transfer client default)")
+	flag.IntVar(&pullRateLimitMiB, "pull-read-rate-limit-mib", 0,
+		"Read rate limit of a pull-mode transfer in MiB per second (0 = unlimited)")
+	flag.DurationVar(&pullBackupTTL, "pull-backup-ttl", controller.DefaultPullBackupTTL,
+		"Lifetime of a pull-mode VirtualMachineBackup; KubeVirt ends the backup when it expires")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -177,6 +190,16 @@ func main() {
 
 	if maxIncrementalBackups < 0 {
 		fmt.Fprintln(os.Stderr, "--max-incremental-backups must be >= 0")
+		os.Exit(1)
+	}
+
+	if backupMode != common.BackupModePush && backupMode != common.BackupModePull {
+		fmt.Fprintf(os.Stderr, "--backup-mode must be %q or %q (got %q)\n",
+			common.BackupModePush, common.BackupModePull, backupMode)
+		os.Exit(1)
+	}
+	if pullReaders < 0 || pullReaders > 64 || pullRateLimitMiB < 0 || pullBackupTTL <= 0 {
+		fmt.Fprintln(os.Stderr, "--pull-readers must be 0..64, --pull-read-rate-limit-mib >= 0 and --pull-backup-ttl > 0")
 		os.Exit(1)
 	}
 
@@ -310,6 +333,10 @@ func main() {
 		DatamoverImagePullPolicy: corev1.PullPolicy(datamoverImagePullPolicy),
 		MaxIncrementalBackups:    maxIncrementalBackups,
 		CompressFullBackups:      compressFullBackups,
+		BackupMode:               backupMode,
+		PullReaders:              pullReaders,
+		PullRateLimitMiB:         pullRateLimitMiB,
+		PullBackupTTL:            pullBackupTTL,
 		OADPNamespace:            oadpNamespace,
 		StaleDataUploadThreshold: staleDataUploadThreshold,
 		PodLogCollector:          controller.NewPodLogCollector(kubeClient, 100),

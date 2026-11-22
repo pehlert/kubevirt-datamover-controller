@@ -119,6 +119,20 @@ type KubeVirtDataUploadReconciler struct {
 	// mounted read-write and sized for the original plus the rewritten copy.
 	CompressFullBackups bool
 
+	// BackupMode is the default transfer mode ("push" or "pull"); empty means
+	// push. A VirtualMachine can override it with AnnotationBackupMode.
+	BackupMode string
+
+	// PullReaders and PullRateLimitMiB tune pull-mode transfers (parallel
+	// ranged reads, read rate limit in MiB/s). Zero keeps the defaults.
+	PullReaders      int
+	PullRateLimitMiB int
+
+	// PullBackupTTL is the lifetime given to a pull-mode VirtualMachineBackup.
+	// KubeVirt ends the backup when it expires, which bounds how long a VM
+	// stays in backup mode if this controller is not there to end it.
+	PullBackupTTL time.Duration
+
 	// StaleDataUploadThreshold is the duration after which a DataUpload in an
 	// active phase is considered stale and will no longer block younger
 	// DataUploads for the same VM.
@@ -144,7 +158,7 @@ type KubeVirtDataUploadReconciler struct {
 // +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get;list;watch;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups="",resources=pods/log,verbs=get
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachines,verbs=get;list;watch
 // +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachineinstances,verbs=get;list;watch
 
@@ -226,9 +240,11 @@ func (r *KubeVirtDataUploadReconciler) Reconcile(ctx context.Context, req ctrl.R
 	case velerov2alpha1.DataUploadPhaseCompleted,
 		velerov2alpha1.DataUploadPhaseFailed,
 		velerov2alpha1.DataUploadPhaseCanceled:
-		// Terminal states - nothing to do
+		// Terminal states - nothing to do, except that a pull-mode backup
+		// leaves a VirtualMachineBackup, token Secrets and a scratch PVC
+		// behind that have to go on every exit path.
 		logger.V(1).Info("DataUpload is in terminal state", "phase", dataUpload.Status.Phase)
-		return ctrl.Result{}, nil
+		return r.finishPullCleanup(ctx, logger, dataUpload)
 
 	default:
 		logger.Info("Unknown DataUpload phase", "phase", dataUpload.Status.Phase)
@@ -421,7 +437,14 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 		}
 	}
 
-	// Step 1: Create or get temporary PVC for backup output
+	// Step 0b: Decide between push and pull transfer, once per DataUpload.
+	if err := r.ensureBackupMode(ctx, logger, du, vmRef); err != nil {
+		return ctrl.Result{}, err
+	}
+	pullMode := isPullMode(du)
+
+	// Step 1: Create or get temporary PVC for backup output (push mode) or
+	// for KubeVirt's copy-before-write scratch file (pull mode)
 	pvc, err := r.ensureTempPVC(ctx, logger, du, vmRef.Namespace)
 	if err != nil {
 		// If a referenced PVC is permanently missing, fail the DataUpload
@@ -516,6 +539,24 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 			}
 		}
 
+		// Step 3b': On a retry of this block (VMB creation was deferred) the
+		// chain lookup is skipped, see resolveBackupMode. Honor a full backup
+		// decided the first time instead of silently allowing an incremental.
+		if !forceFullBackup && checkpointLookup == nil &&
+			du.Annotations[common.AnnotationExpectedBackupType] == uploader.BackupTypeFull {
+			forceFullBackup = true
+		}
+
+		// Step 3b'': A chain never mixes storage formats. If the latest
+		// checkpoint was stored in the other mode's format, start a new chain.
+		if !forceFullBackup && checkpointLookup != nil && checkpointLookup.Found &&
+			checkpointLookup.Format != checkpointFormatFor(du) {
+			logger.Info("Latest checkpoint is stored in another format, forcing full backup",
+				"latestCheckpoint", checkpointLookup.LatestCheckpoint,
+				"checkpointFormat", checkpointLookup.Format, "backupMode", du.Annotations[common.AnnotationBackupMode])
+			forceFullBackup = true
+		}
+
 		// Step 3c: Record expected backup type for mismatch detection.
 		// This annotation lets handlePrepared() compare the actual VMB result
 		// against what the controller intended, and the datamover pod can
@@ -557,9 +598,18 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 		// user override annotation and automatic guest-agent detection.
 		skipQuiesce := r.determineSkipQuiesce(ctx, logger, du, vmRef)
 
+		// Step 3e (pull mode): the export token KubeVirt hands out the data for.
+		tokenSecretName := ""
+		if pullMode {
+			tokenSecretName, err = r.ensurePullTokenSecret(ctx, logger, du, vmRef.Namespace)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+
 		// Step 4: Create VirtualMachineBackup
 		var created bool
-		vmb, created, err = r.ensureVMBackup(ctx, logger, du, vmbt, pvc.Name, vmRef.Namespace, forceFullBackup, skipQuiesce)
+		vmb, created, err = r.ensureVMBackup(ctx, logger, du, vmbt, pvc.Name, vmRef.Namespace, forceFullBackup, skipQuiesce, tokenSecretName)
 		if err != nil {
 			// Check if the error is due to another VMB being in progress for the same VM.
 			// KubeVirt's admission webhook only allows one active (non-terminal) VMB per VM.
@@ -639,6 +689,9 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 		return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
 	}
 
+	if pullMode {
+		return r.evaluatePullBackupStatus(ctx, logger, du, vmb)
+	}
 	return r.evaluateVMBackupStatus(ctx, logger, du, vmb)
 }
 
@@ -1076,6 +1129,10 @@ func (r *KubeVirtDataUploadReconciler) validateBSLCheckpoint(ctx context.Context
 func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload) (ctrl.Result, error) {
 	logger.Info("Handling Prepared phase DataUpload")
 
+	if isPullMode(du) {
+		return r.handlePreparedPull(ctx, logger, du)
+	}
+
 	// Get VM reference for namespace context
 	vmRef, err := common.GetVMReference(du)
 	if err != nil {
@@ -1316,6 +1373,7 @@ func (r *KubeVirtDataUploadReconciler) handleInProgress(ctx context.Context, log
 
 		if du.Annotations[common.AnnotationDatamoverPodSucceeded] != bslValidatedValue {
 			r.emitPodLogs(ctx, logger, pod)
+			r.updatePullProgress(ctx, logger, du, pod)
 			if err := r.markDatamoverPodSucceeded(ctx, du); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -1349,6 +1407,7 @@ func (r *KubeVirtDataUploadReconciler) handleInProgress(ctx context.Context, log
 
 	case corev1.PodPending, corev1.PodRunning:
 		logger.V(1).Info("Datamover pod still running", "pod", pod.Name, "phase", pod.Status.Phase)
+		r.updatePullProgress(ctx, logger, du, pod)
 		return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
 
 	default:
@@ -1414,6 +1473,12 @@ func (r *KubeVirtDataUploadReconciler) cleanupDatamoverResources(ctx context.Con
 	if cleanupNotReady, _ := cleanupPodsByUID(ctx, r.Client, r.APIReader, common.LabelDataUploadUID, string(du.UID), podNamespace, logger); cleanupNotReady {
 		logger.Info("Datamover pod still terminating (or its status couldn't be confirmed), deferring PVC/PV cleanup to next reconcile")
 		return false
+	}
+
+	if isPullMode(du) {
+		// No PV was rebound for the data path; the scratch PVC, the token
+		// Secrets and the backup are removed by finishPullCleanup.
+		return true
 	}
 
 	reboundPVCName := common.SafeResourceName(common.ReboundPVCNamePrefix, du.Name)
@@ -1622,6 +1687,11 @@ func (r *KubeVirtDataUploadReconciler) ensureTempPVC(ctx context.Context, logger
 			},
 		},
 	}
+	if isPullMode(du) {
+		// KubeVirt keeps the copy-before-write scratch image as a file.
+		filesystem := corev1.PersistentVolumeFilesystem
+		pvc.Spec.VolumeMode = &filesystem
+	}
 
 	if err := r.Create(ctx, pvc); err != nil {
 		return nil, fmt.Errorf("failed to create temporary PVC: %w", err)
@@ -1670,7 +1740,10 @@ const compressedSizeOverheadPercent = 120
 
 // backupPVCOverheadPercent returns the overhead to add on top of the source
 // disk capacity when sizing the temporary backup PVC.
-func (r *KubeVirtDataUploadReconciler) backupPVCOverheadPercent() int64 {
+func (r *KubeVirtDataUploadReconciler) backupPVCOverheadPercent(du *velerov2alpha1.DataUpload) int64 {
+	if isPullMode(du) {
+		return pullScratchOverheadPercent
+	}
 	if r.CompressFullBackups {
 		return compressedSizeOverheadPercent
 	}
@@ -1742,7 +1815,7 @@ func (r *KubeVirtDataUploadReconciler) calculateBackupPVCSize(ctx context.Contex
 					}
 				}
 				if !totalCapacity.IsZero() {
-					withOverhead := addOverhead(totalCapacity, r.backupPVCOverheadPercent())
+					withOverhead := addOverhead(totalCapacity, r.backupPVCOverheadPercent(du))
 					if withOverhead.Cmp(minSize) < 0 {
 						withOverhead = minSize
 					}
@@ -1750,7 +1823,7 @@ func (r *KubeVirtDataUploadReconciler) calculateBackupPVCSize(ctx context.Contex
 						"vmName", vmRef.Name,
 						"diskCount", len(pvcNames),
 						"totalCapacity", totalCapacity.String(),
-						"overheadPercent", r.backupPVCOverheadPercent(),
+						"overheadPercent", r.backupPVCOverheadPercent(du),
 						"finalSize", withOverhead.String())
 					return withOverhead, nil
 				}
@@ -1771,14 +1844,14 @@ func (r *KubeVirtDataUploadReconciler) calculateBackupPVCSize(ctx context.Contex
 		}
 
 		if capacity, ok := sourcePVC.Status.Capacity[corev1.ResourceStorage]; ok {
-			withOverhead := addOverhead(capacity, r.backupPVCOverheadPercent())
+			withOverhead := addOverhead(capacity, r.backupPVCOverheadPercent(du))
 			if withOverhead.Cmp(minSize) < 0 {
 				withOverhead = minSize
 			}
 			logger.Info("Sizing backup PVC from source PVC capacity",
 				"sourcePVC", sourcePVCName,
 				"sourceCapacity", capacity.String(),
-				"overheadPercent", r.backupPVCOverheadPercent(),
+				"overheadPercent", r.backupPVCOverheadPercent(du),
 				"finalSize", withOverhead.String())
 			return withOverhead, nil
 		}
@@ -1952,7 +2025,7 @@ func (r *KubeVirtDataUploadReconciler) lookupLatestVMBTFromBSL(ctx context.Conte
 // Note: We don't set an owner reference because VMB is in VM namespace
 // while DataUpload is in OADP namespace (cross-namespace owner refs not allowed).
 // VMB and VMBT are archived to S3 and deleted by the datamover pod after upload.
-func (r *KubeVirtDataUploadReconciler) ensureVMBackup(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, vmbt *kubevirtbackupv1alpha1.VirtualMachineBackupTracker, pvcName, namespace string, forceFullBackup, skipQuiesce bool) (*kubevirtbackupv1alpha1.VirtualMachineBackup, bool, error) {
+func (r *KubeVirtDataUploadReconciler) ensureVMBackup(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, vmbt *kubevirtbackupv1alpha1.VirtualMachineBackupTracker, pvcName, namespace string, forceFullBackup, skipQuiesce bool, pullTokenSecret string) (*kubevirtbackupv1alpha1.VirtualMachineBackup, bool, error) {
 	// Find existing VMB for this DataUpload
 	existingVMB, err := r.findVMBForDataUpload(ctx, du, namespace)
 	if err != nil {
@@ -1988,7 +2061,12 @@ func (r *KubeVirtDataUploadReconciler) ensureVMBackup(ctx context.Context, logge
 		},
 	}
 
-	if err := r.Create(ctx, vmb); err != nil {
+	if pullTokenSecret != "" {
+		if err := r.createPullVMBackup(ctx, vmb, pullTokenSecret); err != nil {
+			return nil, false, fmt.Errorf("failed to create VirtualMachineBackup: %w", err)
+		}
+		logger.Info("Creating VirtualMachineBackup in pull mode", "vmb", vmb.Name, "ttl", r.pullBackupTTL().String())
+	} else if err := r.Create(ctx, vmb); err != nil {
 		return nil, false, fmt.Errorf("failed to create VirtualMachineBackup: %w", err)
 	}
 	if forceFullBackup {
