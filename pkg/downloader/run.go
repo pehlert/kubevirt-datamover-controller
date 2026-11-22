@@ -21,10 +21,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"github.com/go-logr/logr"
+	velero "github.com/vmware-tanzu/velero/pkg/plugin/velero"
 
 	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
+	"github.com/migtools/kubevirt-datamover-controller/pkg/puller"
 	"github.com/migtools/kubevirt-datamover-controller/pkg/uploader"
 )
 
@@ -91,7 +94,16 @@ func Run(ctx context.Context, logger logr.Logger) error {
 		return fmt.Errorf("failed to resolve checkpoint chain: %w", err)
 	}
 
-	logger.Info("Resolved checkpoint chain", "checkpoints", len(files))
+	format, err := chainFormat(manifest.CheckpointChain, vmIndex)
+	if err != nil {
+		return fmt.Errorf("failed to resolve checkpoint chain: %w", err)
+	}
+
+	logger.Info("Resolved checkpoint chain", "checkpoints", len(files), "format", format)
+
+	if format == uploader.CheckpointFormatBlocks {
+		return restoreBlockChain(ctx, store, config, files, logger)
+	}
 
 	localPaths, err := downloadCheckpointFiles(ctx, store, config.BSLBucket, files, config.ScratchPath)
 	if err != nil {
@@ -145,6 +157,84 @@ func Run(ctx context.Context, logger logr.Logger) error {
 
 	logger.Info("Download completed successfully", "target", config.TargetPath)
 
+	return nil
+}
+
+// chainFormat returns the storage format shared by all checkpoints of a
+// chain. A chain that mixes formats cannot be restored: the qcow2 path
+// replays backing files, the block path merges block indexes.
+func chainFormat(chain []string, vmIndex uploader.VMIndex) (string, error) {
+	formats := make(map[string]string, len(vmIndex.Checkpoints))
+	for _, entry := range vmIndex.Checkpoints {
+		formats[entry.ID] = entry.Format
+	}
+	format := ""
+	for pos, id := range chain {
+		entryFormat, ok := formats[id]
+		if !ok {
+			return "", fmt.Errorf("checkpoint %q referenced in backup chain not found in VM index", id)
+		}
+		switch entryFormat {
+		case uploader.CheckpointFormatQcow2, uploader.CheckpointFormatBlocks:
+		default:
+			return "", fmt.Errorf("checkpoint %q has unknown storage format %q", id, entryFormat)
+		}
+		if pos == 0 {
+			format = entryFormat
+		} else if entryFormat != format {
+			return "", fmt.Errorf("checkpoint %q is stored in another format than the checkpoints before it", id)
+		}
+	}
+	return format, nil
+}
+
+// restoreBlockChain restores a disk whose checkpoints are stored in block
+// format. Nothing is staged: every needed block is fetched with a ranged
+// read, verified and written to its place in the target.
+func restoreBlockChain(
+	ctx context.Context, store velero.ObjectStore, config *DownloaderConfig, files []uploader.CheckpointFile, logger logr.Logger,
+) error {
+	dataObjects := make([]string, 0, len(files))
+	for _, file := range files {
+		dataObjects = append(dataObjects, file.ObjectPath)
+	}
+	opts := puller.RestoreOptions{TargetIsBlockDevice: config.TargetIsBlockDevice}
+	if v := os.Getenv(EnvRestoreWorkers); v != "" {
+		workers, err := strconv.Atoi(v)
+		if err != nil || workers < 1 {
+			return fmt.Errorf("%s must be a positive number, got %q", EnvRestoreWorkers, v)
+		}
+		opts.Workers = workers
+	}
+
+	if config.TargetIsBlockDevice {
+		if err := puller.RestoreChain(ctx, store, config.BSLBucket, dataObjects, config.TargetPath, opts, logger); err != nil {
+			return fmt.Errorf("failed to restore disk from block checkpoints: %w", err)
+		}
+		logger.Info("Download completed successfully", "target", config.TargetPath)
+		return nil
+	}
+
+	// Same publish pattern as the qcow2 path: write next to the target and
+	// rename, so a partly restored image never sits at the target path.
+	tmpFile, err := os.CreateTemp(filepath.Dir(config.TargetPath), "."+filepath.Base(config.TargetPath)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("failed to create temporary target: %w", err)
+	}
+	tmpTargetPath := tmpFile.Name()
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmpTargetPath)
+		return fmt.Errorf("failed to create temporary target: %w", err)
+	}
+	defer func() { _ = os.Remove(tmpTargetPath) }()
+
+	if err := puller.RestoreChain(ctx, store, config.BSLBucket, dataObjects, tmpTargetPath, opts, logger); err != nil {
+		return fmt.Errorf("failed to restore disk from block checkpoints: %w", err)
+	}
+	if err := os.Rename(tmpTargetPath, config.TargetPath); err != nil {
+		return fmt.Errorf("failed to publish restored disk image: %w", err)
+	}
+	logger.Info("Download completed successfully", "target", config.TargetPath)
 	return nil
 }
 

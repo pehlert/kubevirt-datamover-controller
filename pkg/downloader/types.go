@@ -35,6 +35,12 @@ limitations under the License.
 //     its predecessor (the path recorded at backup time won't exist on the
 //     restore pod's filesystem), then flatten the chain to a single raw disk
 //     image via qemu-img convert.
+//
+// Checkpoints stored in block format (written by the pull backup mode, see
+// pkg/puller) skip steps 3 and 4: the block indexes of the chain are merged
+// and every needed block is fetched with a ranged read from the newest
+// checkpoint that has it, verified against its checksum and written sparsely
+// to the target. A chain is restored in one format or the other, never both.
 package downloader
 
 import "github.com/migtools/kubevirt-datamover-controller/pkg/common"
@@ -53,6 +59,9 @@ const (
 	EnvTargetPath          = "KUBEVIRT_DM_TARGET_PATH"
 	EnvScratchPath         = "KUBEVIRT_DM_SCRATCH_PATH"
 	EnvTargetIsBlockDevice = "KUBEVIRT_DM_TARGET_IS_BLOCK_DEVICE"
+	// EnvRestoreWorkers sets the number of parallel ranged downloads when
+	// restoring checkpoints stored in block format.
+	EnvRestoreWorkers = "KUBEVIRT_DM_RESTORE_WORKERS"
 )
 
 // Default paths and values
