@@ -63,10 +63,15 @@ const (
 	ExportReadyReason = "ExportReady"
 
 	defaultProgressInterval = 10 * time.Second
-	pausePollInterval       = 3 * time.Second
 	minPartSize             = 16 << 20
 	maxUploadParts          = 8000
 )
+
+// pausePollInterval is how often the VM is checked for a pause.
+var pausePollInterval = 3 * time.Second
+
+// transferDefaults supplies the transfer options; tests shorten the retries.
+var transferDefaults = DefaultTransferOptions
 
 // ErrVMPaused ends a transfer because the VM was paused while its backup was open.
 var ErrVMPaused = errors.New("the virtual machine is paused")
@@ -263,7 +268,7 @@ func runTransfer(parent context.Context, cfg *Config, store velero.ObjectStore, 
 	go watchPaused(ctx, k8sClient, cfg, cancel, logger)
 
 	progress := &Progress{}
-	opts := DefaultTransferOptions()
+	opts := transferDefaults()
 	opts.Readers = cfg.Readers
 	opts.Limiter = NewRateLimiter(cfg.RateLimitBytes)
 	opts.Progress = progress
