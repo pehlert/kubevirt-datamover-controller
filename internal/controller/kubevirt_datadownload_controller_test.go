@@ -1163,7 +1163,7 @@ func TestCalculateWorkPVCSize(t *testing.T) {
 // TestCalculateOutputPVCSize covers the Block-mode restore's output PVC
 // sizing: unlike calculateScratchPVCSize, it must drop the chain-file
 // component entirely (the qcow2 chain lives on the separate work PVC instead)
-// and size purely off the max known original-disk capacity.
+// and size to exactly the max known original-disk capacity, without headroom.
 func TestCalculateOutputPVCSize(t *testing.T) {
 	vmIndex := uploader.VMIndex{
 		VMName:    "vm-1",
@@ -1180,7 +1180,7 @@ func TestCalculateOutputPVCSize(t *testing.T) {
 
 	t.Run("sized from max PVCSizes across chain, ignoring file sizes", func(t *testing.T) {
 		got := calculateOutputPVCSize(logr.Discard(), vmIndex, []string{"cp-1"}, "disk-1", resource.Quantity{})
-		want := addOverhead(resource.MustParse("10Gi"), sizeOverheadPercent)
+		want := resource.MustParse("10Gi")
 		if got.Cmp(want) != 0 {
 			t.Errorf("size = %s, want exactly %s", got.String(), want.String())
 		}
@@ -1188,7 +1188,7 @@ func TestCalculateOutputPVCSize(t *testing.T) {
 
 	t.Run("floored by target disk capacity when no chain match", func(t *testing.T) {
 		got := calculateOutputPVCSize(logr.Discard(), vmIndex, []string{"cp-99"}, "disk-1", resource.MustParse("20Gi"))
-		want := addOverhead(resource.MustParse("20Gi"), sizeOverheadPercent)
+		want := resource.MustParse("20Gi")
 		if got.Cmp(want) != 0 {
 			t.Errorf("size = %s, want exactly %s", got.String(), want.String())
 		}

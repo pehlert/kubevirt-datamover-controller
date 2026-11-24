@@ -773,7 +773,7 @@ func calculateScratchPVCSize(logger logr.Logger, vmIndex uploader.VMIndex, chain
 // size. Shared by calculateScratchPVCSize (Filesystem-mode target, where this
 // is the raw-disk-size component of the single scratch PVC) and
 // calculateOutputPVCSize (Block-mode target, where it's the entire output
-// PVC size before overhead).
+// PVC size).
 func maxDiskSizeFromIndex(vmIndex uploader.VMIndex, chain []string, targetVolume string, targetDiskCapacity resource.Quantity) resource.Quantity {
 	chainSet := make(map[string]bool, len(chain))
 	for _, id := range chain {
@@ -848,16 +848,17 @@ func calculateWorkPVCSize(logger logr.Logger, files []uploader.CheckpointFile) r
 }
 
 // calculateOutputPVCSize sizes the Block-mode output PVC that receives the
-// final flattened raw disk image for a Block-mode restore target (see
-// DatamoverPodConfig.OutputPVCName's doc comment). Unlike
-// calculateScratchPVCSize, this drops the chain-file component entirely --
-// the qcow2 chain lives on the separate work PVC instead, so this volume only
-// ever needs to hold the flattened raw image. Sized from the max original-disk
-// capacity (maxDiskSizeFromIndex, floored by targetDiskCapacity) plus
-// sizeOverheadPercent headroom. Falls back to DefaultScratchPVCSize (logged
+// final raw disk image for a Block-mode restore target (see
+// DatamoverPodConfig.OutputPVCName's doc comment). This volume becomes the
+// restored disk, so it is sized to exactly the original disk: the max
+// original-disk capacity (maxDiskSizeFromIndex, floored by targetDiskCapacity)
+// with no headroom. A raw image written to a block device needs no space
+// beyond the disk itself, and any extra would show up in the guest as a
+// larger disk than the one that was backed up. The recorded capacity is the
+// larger of the source PVC's request and its bound PV's capacity, so it
+// covers the whole source device. Falls back to DefaultScratchPVCSize (logged
 // loudly) if neither PVCSizes metadata nor targetDiskCapacity are populated.
 func calculateOutputPVCSize(logger logr.Logger, vmIndex uploader.VMIndex, chain []string, targetVolume string, targetDiskCapacity resource.Quantity) resource.Quantity {
-	minSize := resource.MustParse("1Gi")
 	defaultSize := resource.MustParse(DefaultScratchPVCSize)
 
 	maxDiskSize := maxDiskSizeFromIndex(vmIndex, chain, targetVolume, targetDiskCapacity)
@@ -867,18 +868,10 @@ func calculateOutputPVCSize(logger logr.Logger, vmIndex uploader.VMIndex, chain 
 		return defaultSize
 	}
 
-	withOverhead := addOverhead(maxDiskSize, sizeOverheadPercent)
-	finalSize := withOverhead
-	if withOverhead.Cmp(minSize) < 0 {
-		finalSize = minSize
-	}
-
-	logger.Info("Sizing Block-mode restore's output PVC from checkpoint chain metadata",
+	logger.Info("Sizing Block-mode restore's output PVC to the original disk size",
 		"targetVolume", targetVolume,
-		"maxDiskSize", maxDiskSize.String(),
-		"overheadPercent", sizeOverheadPercent,
-		"finalSize", finalSize.String())
-	return finalSize
+		"finalSize", maxDiskSize.String())
+	return maxDiskSize
 }
 
 // findScratchPVC finds the unique scratch PVC associated with a DataDownload
